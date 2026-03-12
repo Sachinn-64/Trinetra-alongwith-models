@@ -309,6 +309,188 @@ def health_check():
         "version": "2.0"
     })
 
+
+# 🔹 Live stream analysis endpoint
+@app.route('/analyze-stream', methods=['POST'])
+def analyze_stream():
+    """
+    Capture snapshots from the live RTSP stream at regular intervals,
+    send each to Gemini for threat analysis, and return results.
+
+    Form fields:
+      max_seconds  – how long to scan (default 30)
+      interval_sec – seconds between captures (default 3)
+    """
+    try:
+        max_seconds = int(request.form.get('max_seconds', 30))
+        interval_sec = int(request.form.get('interval_sec', 3))
+
+        rtsp_url = "rtsp://localhost:8554/webcam"
+        print(f"[stream] Connecting to {rtsp_url} — scan {max_seconds}s, interval {interval_sec}s")
+
+        cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+        if not cap.isOpened():
+            return jsonify({
+                "error": "Could not connect to live stream. Make sure MediaMTX and ffmpeg are running.",
+                "success": False,
+            }), 500
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if fps <= 0:
+            fps = 30
+
+        max_frames = int(fps * max_seconds)
+        interval_frames = int(fps * interval_sec)
+        if interval_frames < 1:
+            interval_frames = 1
+
+        model = genai.GenerativeModel("gemini-2.5-flash")
+
+        prompt = """
+        You are an AI security monitoring system analyzing CCTV footage in spiritual places.
+        Carefully examine this frame and detect:
+        1. Weapons or harmful objects (guns, knives, explosives, sticks, stones, etc.)
+        2. People fighting or in physical altercations
+        3. Fire, smoke, or fire-related incidents
+        4. Any suspicious or dangerous behavior
+
+        Respond ONLY in this JSON structure:
+        {
+          "status": "safe" | "anomaly" | "danger" | "critical",
+          "summary": "Brief description of what was detected",
+          "weapons": ["gun", "knife"] or [],
+          "fighting_detected": true/false,
+          "fire_detected": true/false,
+          "suspicious_activity": true/false
+        }
+
+        Status Rules:
+        - "critical": Fire, explosives, or life-threatening weapons detected
+        - "danger": Weapons, fighting, or serious threats detected
+        - "anomaly": Suspicious activity or minor threats detected
+        - "safe": No threats detected
+
+        Be thorough but accurate in your analysis.
+        """
+
+        frame_count = 0
+        results = []
+
+        while frame_count < max_frames:
+            ret, frame = cap.read()
+            if not ret:
+                print("[stream] Frame read failed, skipping…")
+                frame_count += 1
+                continue
+
+            if frame_count % interval_frames == 0:
+                timestamp = round(frame_count / fps, 2)
+
+                # Encode frame as JPEG bytes for Gemini
+                _, buffer = cv2.imencode('.jpg', frame)
+                image_bytes = buffer.tobytes()
+
+                # Call Gemini
+                try:
+                    response = model.generate_content([
+                        prompt,
+                        {"mime_type": "image/jpeg", "data": image_bytes},
+                    ])
+
+                    try:
+                        match = re.search(r'{.*}', response.text.strip(), re.DOTALL)
+                        if match:
+                            frame_analysis = json.loads(match.group())
+                        else:
+                            frame_analysis = {
+                                "status": "error",
+                                "summary": "Failed to parse analysis",
+                                "weapons": [],
+                                "fighting_detected": False,
+                                "fire_detected": False,
+                                "suspicious_activity": False,
+                            }
+                    except json.JSONDecodeError:
+                        frame_analysis = {
+                            "status": "error",
+                            "summary": "Analysis parsing error",
+                            "weapons": [],
+                            "fighting_detected": False,
+                            "fire_detected": False,
+                            "suspicious_activity": False,
+                        }
+
+                except Exception as e:
+                    print(f"[stream] Gemini API error: {e}")
+                    frame_analysis = {
+                        "status": "error",
+                        "summary": f"API call failed: {str(e)}",
+                        "weapons": [],
+                        "fighting_detected": False,
+                        "fire_detected": False,
+                        "suspicious_activity": False,
+                    }
+
+                result_entry = {
+                    "frame": frame_count,
+                    "timestamp_sec": timestamp,
+                    "analysis": frame_analysis,
+                }
+
+                # Attach screenshot if threat detected
+                should_capture = (
+                    frame_analysis.get("status") in ["danger", "critical", "anomaly"]
+                    or frame_analysis.get("weapons")
+                    or frame_analysis.get("fighting_detected")
+                    or frame_analysis.get("fire_detected")
+                    or frame_analysis.get("suspicious_activity")
+                )
+
+                if should_capture:
+                    screenshot = encode_image_to_base64(frame)
+                    if screenshot:
+                        result_entry["frame_screenshot"] = screenshot
+
+                    if (
+                        frame_analysis.get("fighting_detected")
+                        or frame_analysis.get("weapons")
+                        or frame_analysis.get("status") in ["danger", "critical"]
+                    ):
+                        person_images = extract_person_images(frame, frame_analysis)
+                        if person_images:
+                            result_entry["person_images"] = person_images
+
+                results.append(result_entry)
+                print(
+                    f"[stream] {timestamp}s | {frame_analysis.get('status')} | "
+                    f"{frame_analysis.get('summary', 'N/A')}"
+                )
+
+            frame_count += 1
+
+        cap.release()
+
+        threats = [
+            r for r in results
+            if r.get("analysis", {}).get("status") in ["danger", "critical", "anomaly"]
+        ]
+
+        print(f"[stream] Done. {len(results)} snapshots, {len(threats)} threat(s).")
+
+        return jsonify({
+            "success": True,
+            "results": results,
+            "total_frames": len(results),
+            "threats_detected": len(threats),
+        }), 200
+
+    except Exception as e:
+        print(f"[stream] Error: {e}")
+        return jsonify({
+            "error": f"Stream analysis failed: {str(e)}",
+            "success": False,
+        }), 500
+
 if __name__ == '__main__':
     port = int(os.getenv('PORT', 5002))
     debug = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
