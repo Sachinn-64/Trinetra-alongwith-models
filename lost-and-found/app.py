@@ -14,6 +14,8 @@ import base64
 from datetime import datetime
 import json
 
+from person_detector import HybridPersonDetector, get_insight_app
+
 app = Flask(__name__)
 CORS(app)
 app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max file size
@@ -35,151 +37,12 @@ ALLOWED_EXTENSIONS_VIDEO = {'mp4', 'avi', 'mov', 'mkv', 'wmv'}
 def allowed_file(filename, allowed_extensions):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in allowed_extensions
 
-class PersonDetector:
-    def __init__(self, person_image_path, video_path):
-        """
-        Initialize the person detector with the lost person's image and crowd video.
-        
-        Args:
-            person_image_path (str): Path to the lost person's image
-            video_path (str): Path to the crowd video
-        """
-        self.person_image_path = person_image_path
-        self.video_path = video_path
-        self.person_encoding = None
-        
-    def load_person_encoding(self):
-        """Load and encode the lost person's face."""
-        try:
-            # Load the person's image
-            person_image = face_recognition.load_image_file(self.person_image_path)
-            
-            # Find face encodings in the person's image
-            face_encodings = face_recognition.face_encodings(person_image)
-            
-            if len(face_encodings) == 0:
-                return False, "No face found in the person's image. Please use an image with a clear face."
-            
-            # Use the first face encoding found
-            self.person_encoding = face_encodings[0]
-            return True, "Successfully loaded person's face encoding."
-            
-        except Exception as e:
-            return False, f"Error loading person's image: {str(e)}"
-    
-    def detect_person_in_video(self, output_video_path, tolerance=0.6, frame_skip=5):
-        """
-        Detect the lost person in the crowd video and create output video.
-        
-        Args:
-            output_video_path (str): Path to save the output video
-            tolerance (float): Face recognition tolerance (lower = more strict)
-            frame_skip (int): Process every nth frame to speed up detection
-        """
-        if self.person_encoding is None:
-            return False, "Person encoding not loaded."
-        
-        # Open the video file
-        video = cv2.VideoCapture(self.video_path)
-        
-        if not video.isOpened():
-            return False, "Could not open video file."
-        
-        # Get video properties
-        fps = int(video.get(cv2.CAP_PROP_FPS))
-        width = int(video.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(video.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        # Initialize video writer with better codec compatibility
-        try:
-            fourcc = cv2.VideoWriter_fourcc(*'avc1')  # Try H.264 codec first
-            out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
-            if not out.isOpened():
-                # Fallback to MP4V if H.264 fails
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
-        except Exception as e:
-            logger.warning(f"Codec initialization failed: {e}, using MP4V fallback")
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(output_video_path, fourcc, fps, (width, height))
-        
-        frame_count = 0
-        detected_frames = 0
-        detection_timestamps = []
-        detection_frame_path = None
-        
-        logger.info("Starting person detection in video...")
-        logger.info(f"Processing every {frame_skip}th frame for efficiency.")
-        
-        while True:
-            ret, frame = video.read()
-            
-            if not ret:
-                break
-            
-            # Process every nth frame to speed up detection
-            if frame_count % frame_skip == 0:
-                # Convert BGR to RGB (face_recognition uses RGB)
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                
-                # Find faces in the current frame
-                face_locations = face_recognition.face_locations(rgb_frame)
-                face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
-                
-                # Check if any face matches the person we're looking for
-                person_found_in_frame = False
-                for i, face_encoding in enumerate(face_encodings):
-                    # Compare faces
-                    matches = face_recognition.compare_faces([self.person_encoding], face_encoding, tolerance=tolerance)
-                    
-                    if matches[0]:
-                        # Person found! Draw rectangle and add timestamp
-                        top, right, bottom, left = face_locations[i]
-                        cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
-                        cv2.putText(frame, "PERSON FOUND!", (left, top - 10), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-                        
-                        # Add timestamp
-                        timestamp = frame_count / fps
-                        cv2.putText(frame, f"Time: {timestamp:.2f}s", (left, bottom + 25), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                        
-                        person_found_in_frame = True
-                        detected_frames += 1
-                        detection_timestamps.append(timestamp)
-                        
-                        # Save the first detection frame as a separate image
-                        if detection_frame_path is None:
-                            detection_frame_path = output_video_path.replace('.mp4', '_detection_frame.jpg')
-                            cv2.imwrite(detection_frame_path, frame)
-                            logger.info(f"Saved detection frame: {detection_frame_path}")
-                        
-                        logger.info(f"Person detected in frame {frame_count} at {timestamp:.2f}s")
-                
-                # Write frame to output video (with or without detection)
-                out.write(frame)
-                
-                # Show progress
-                if frame_count % 100 == 0:
-                    progress = (frame_count / total_frames) * 100
-                    logger.info(f"Progress: {progress:.1f}% ({frame_count}/{total_frames} frames)")
-            
-            frame_count += 1
-        
-        video.release()
-        out.release()
-        
-        logger.info(f"Detection complete! Total frames processed: {frame_count}")
-        logger.info(f"Frames with person detected: {detected_frames}")
-        
-        return True, {
-            "total_frames": frame_count,
-            "detected_frames": detected_frames,
-            "detection_timestamps": detection_timestamps,
-            "output_video_path": output_video_path,
-            "detection_frame_path": detection_frame_path
-        }
+# Pre-load InsightFace model at startup so the first request isn't slow
+logger.info("Pre-loading InsightFace model…")
+try:
+    get_insight_app()
+except Exception as e:
+    logger.warning(f"InsightFace pre-load failed (will retry on first request): {e}")
 
 @app.route('/')
 def index():
@@ -241,10 +104,13 @@ def detect_person():
         
         logger.info(f"Files uploaded: {person_filename}, {video_filename}")
         
-        # Initialize detector
-        detector = PersonDetector(person_path, video_path)
+        # Initialize hybrid detector (dlib + InsightFace)
+        detector = HybridPersonDetector(
+            person_path, video_path,
+            dlib_tolerance=tolerance,
+        )
         
-        # Load person encoding
+        # Load person encoding with both engines
         success, message = detector.load_person_encoding()
         if not success:
             # Clean up uploaded files
@@ -324,10 +190,9 @@ def not_found(e):
 @app.route('/api/detect-stream', methods=['POST'])
 def detect_stream():
     """
-    Detect a person in the live RTSP stream.
-    Accepts: person_image file, optional tolerance & max_seconds.
-    Reads frames from the RTSP stream, runs face recognition,
-    and returns detected frames as base64 images.
+    Detect a person in the live RTSP stream using hybrid detection
+    (dlib face_recognition + InsightFace ArcFace).
+    Accepts: person_image file, optional tolerance, insight_threshold & max_seconds.
     """
     try:
         if 'person_image' not in request.files:
@@ -338,8 +203,9 @@ def detect_stream():
             return jsonify({'error': 'Invalid image format. Allowed: png, jpg, jpeg, gif, bmp'}), 400
 
         tolerance = float(request.form.get('tolerance', 0.6))
+        insight_threshold = float(request.form.get('insight_threshold', 0.35))
         frame_skip = int(request.form.get('frame_skip', 5))
-        max_seconds = int(request.form.get('max_seconds', 30))  # scan duration
+        max_seconds = int(request.form.get('max_seconds', 30))
 
         # Save person image
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -348,20 +214,25 @@ def detect_stream():
         person_path = os.path.join(app.config['UPLOAD_FOLDER'], person_filename)
         person_file.save(person_path)
 
-        # Load face encoding
-        try:
-            person_image = face_recognition.load_image_file(person_path)
-            face_encodings = face_recognition.face_encodings(person_image)
-            if len(face_encodings) == 0:
-                os.remove(person_path)
-                return jsonify({"error": "No face found in the uploaded image. Please use a clear face photo."}), 400
-            person_encoding = face_encodings[0]
-        except Exception as e:
+        # Create hybrid detector (no video needed, we'll read frames manually)
+        rtsp_url = "rtsp://localhost:8554/webcam"
+        detector = HybridPersonDetector(
+            person_image_path=person_path,
+            video_path=rtsp_url,
+            insight_threshold=insight_threshold,
+            dlib_tolerance=tolerance,
+        )
+
+        # Load person encodings with both engines
+        ok, msg = detector.load_person_encoding()
+        if not ok:
             os.remove(person_path)
-            return jsonify({"error": f"Failed to process person image: {str(e)}"}), 400
+            return jsonify({"error": msg}), 400
+
+        logger.info(f"Hybrid detector ready — dlib: {detector.dlib_encoding is not None}, "
+                     f"insightface: {detector.insight_embedding is not None}")
 
         # Open RTSP stream
-        rtsp_url = "rtsp://localhost:8554/webcam"
         logger.info(f"Connecting to RTSP stream: {rtsp_url}")
         video = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
 
@@ -371,7 +242,7 @@ def detect_stream():
 
         fps = video.get(cv2.CAP_PROP_FPS)
         if fps <= 0:
-            fps = 30  # fallback for streams
+            fps = 30
 
         max_frames = int(fps * max_seconds)
         frame_count = 0
@@ -387,53 +258,64 @@ def detect_stream():
                 continue
 
             if frame_count % frame_skip == 0:
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                face_locations = face_recognition.face_locations(rgb_frame)
-                enc_list = face_recognition.face_encodings(rgb_frame, face_locations)
+                # Use hybrid match_frame (runs both dlib + InsightFace)
+                matches = detector.match_frame(frame)
 
-                for i, face_enc in enumerate(enc_list):
-                    matches = face_recognition.compare_faces([person_encoding], face_enc, tolerance=tolerance)
-                    if matches[0]:
-                        top, right, bottom, left = face_locations[i]
-                        # Draw bounding box
-                        cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 3)
-                        cv2.putText(frame, "PERSON FOUND", (left, top - 10),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+                for m in matches:
+                    left, top, right, bottom = m["bbox"]
+                    engine = m["engine"]
+                    score = m["score"]
 
-                        time_sec = round(frame_count / fps, 2)
-                        cv2.putText(frame, f"Time: {time_sec}s", (left, bottom + 25),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    # Color by engine: green=both, blue=insightface, yellow=dlib
+                    if engine == "both":
+                        color = (0, 255, 0)
+                    elif engine == "insightface":
+                        color = (255, 180, 0)
+                    else:
+                        color = (0, 255, 255)
 
-                        # Encode frame as base64 JPEG
-                        _, buffer = cv2.imencode('.jpg', frame)
-                        frame_b64 = base64.b64encode(buffer).decode('utf-8')
+                    cv2.rectangle(frame, (left, top), (right, bottom), color, 3)
+                    label = f"FOUND [{engine}] {score:.2f}"
+                    cv2.putText(frame, label, (left, top - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
 
-                        # Crop face region with padding
-                        pad = 40
-                        h, w = frame.shape[:2]
-                        crop_top = max(0, top - pad)
-                        crop_bottom = min(h, bottom + pad)
-                        crop_left = max(0, left - pad)
-                        crop_right = min(w, right + pad)
-                        face_crop = frame[crop_top:crop_bottom, crop_left:crop_right]
-                        _, face_buf = cv2.imencode('.jpg', face_crop)
-                        face_b64 = base64.b64encode(face_buf).decode('utf-8')
+                    time_sec = round(frame_count / fps, 2)
+                    cv2.putText(frame, f"Time: {time_sec}s", (left, bottom + 25),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-                        # Also save to disk
-                        det_filename = f"detection_{timestamp}_{unique_id}_{len(detections)}.jpg"
-                        det_path = os.path.join(app.config['OUTPUT_FOLDER'], det_filename)
-                        cv2.imwrite(det_path, frame)
+                    # Encode full frame as base64
+                    _, buffer = cv2.imencode('.jpg', frame)
+                    frame_b64 = base64.b64encode(buffer).decode('utf-8')
 
-                        detections.append({
-                            "frame": frame_count,
-                            "timestamp_sec": time_sec,
-                            "frame_image": f"data:image/jpeg;base64,{frame_b64}",
-                            "face_crop": f"data:image/jpeg;base64,{face_b64}",
-                            "bbox": [left, top, right, bottom],
-                            "saved_file": det_filename,
-                        })
+                    # Crop face region with padding
+                    pad = 40
+                    h, w = frame.shape[:2]
+                    crop_top = max(0, top - pad)
+                    crop_bottom = min(h, bottom + pad)
+                    crop_left = max(0, left - pad)
+                    crop_right = min(w, right + pad)
+                    face_crop = frame[crop_top:crop_bottom, crop_left:crop_right]
+                    _, face_buf = cv2.imencode('.jpg', face_crop)
+                    face_b64 = base64.b64encode(face_buf).decode('utf-8')
 
-                        logger.info(f"Person detected at frame {frame_count} ({time_sec}s)")
+                    # Save to disk
+                    det_filename = f"detection_{timestamp}_{unique_id}_{len(detections)}.jpg"
+                    det_path = os.path.join(app.config['OUTPUT_FOLDER'], det_filename)
+                    cv2.imwrite(det_path, frame)
+
+                    detections.append({
+                        "frame": frame_count,
+                        "timestamp_sec": time_sec,
+                        "frame_image": f"data:image/jpeg;base64,{frame_b64}",
+                        "face_crop": f"data:image/jpeg;base64,{face_b64}",
+                        "bbox": [left, top, right, bottom],
+                        "engine": engine,
+                        "score": round(score, 3),
+                        "saved_file": det_filename,
+                    })
+
+                    logger.info(f"Person detected at frame {frame_count} ({time_sec}s) "
+                                f"via {engine} (score={score:.3f})")
 
             frame_count += 1
 
